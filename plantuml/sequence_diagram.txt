@@ -1,0 +1,30 @@
+@startuml
+title Wireless Audio over IP — I2S to Client Audio Output
+
+participant "I2S" as I2S
+participant "ESP32" as ESP
+participant "Client Receiver" as RX
+participant "Jitter Buffer" as Jitter
+participant "PLC" as PLC
+participant "Speaker Driver" as Speaker
+
+== Capture and transmit ==
+loop audio buffers
+  I2S -> ESP : PCM buffer ready
+  ESP -> ESP : packetize PCM + Timestamp
+  ESP -> RX : Send packet over 802.11+UDP
+end
+
+== Receive and play ==
+loop playout buffers
+  RX -> Jitter : enqueue packet
+
+  alt buffer arrives before deadline
+    Jitter -> PLC : audio buffer
+    PLC -> Speaker : play buffer
+  else buffer missing or late
+    Jitter -> PLC : conceal buffer
+    PLC -> Speaker : synthesized audio
+  end
+end
+@enduml
