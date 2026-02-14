@@ -2,22 +2,18 @@ CS578 Project ig
 
 ## BOM
 
-### ESP32 
-Link: https://www.amazon.com/dp/B0G4CY619B?ref_=pe_125775000_1044873430_t_fed_asin_title
-Status: Ordered
+**Processing**
+* ESP32-S3 Dev Board: ordered
+* M5Stack Audio Module (ES8388): ordered
 
-### M5Stack Audio Module (ES8388)
-Link: https://shop.m5stack.com/products/m5stack-audio-module-es8388
-Status: Considering
+**Analog**
+* Buffered pedal output: ordered
+* ZTS6631 I²S MEMS mic: ordered
 
-### JFET Buffer
-Link: https://www.pedalpcb.com/product/jfetbuffer
-Status: Not Ordered
+**Power**
+* 9 V supply: on hand
+* 5 V / 3.3 V regulator (breadboard kit): ordered
 
-### Power Source
-Link:
-Status: Not selected
+**Prototyping**
+* Breadboard kit (board, jumpers, passives) — ordered
 
-### Backup I2S Digital Mic
-Link:
-Status: Not selected
