@@ -6,7 +6,7 @@ CS578 Project ig
 * ESP32-S3 Dev Board: ordered
 * M5Stack Audio Module (ES8388): ordered
 
-**Analog**
+**Input**
 * Buffered pedal output: ordered
 * ZTS6631 I²S MEMS mic: ordered
 
