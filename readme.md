@@ -15,5 +15,5 @@ CS578 Project ig
 * 5 V / 3.3 V regulator (breadboard kit): ordered
 
 **Prototyping**
-* Breadboard kit (board, jumpers, passives) — ordered
+* Breadboard kit (board, jumpers, passives): ordered
 
