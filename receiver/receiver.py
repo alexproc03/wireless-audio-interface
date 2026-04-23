@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
+import socket
+import struct
 
 
 @dataclass
@@ -24,16 +26,65 @@ class PlcFrame:
     timestamp: int
 
 
+@dataclass
+class StreamMetrics:
+    packets_received: int = 0
+    packets_lost: int = 0
+    loss_rate: float = 0.0
+ 
+ 
+class MetricsCollector:
+    def __init__(self):
+        self._received = 0
+        self._highest_seq: Optional[int] = None
+ 
+    def push(self, packet: AudioPacket) -> None:
+        self._received += 1
+        if self._highest_seq is None or packet.sequence > self._highest_seq:
+            self._highest_seq = packet.sequence
+ 
+    def snapshot(self) -> StreamMetrics:
+        if self._highest_seq is None:
+            return StreamMetrics()
+        expected = self._highest_seq + 1
+        lost = max(0, expected - self._received)
+        return StreamMetrics(
+            packets_received=self._received,
+            packets_lost=lost,
+            loss_rate=lost / expected if expected > 0 else 0.0,
+        )
+ 
+ 
 class UdpReceiver:
-    """
-    Receives UDP datagrams and parses them into AudioPacket objects.
-    """
-
+    def __init__(self, host: str = "0.0.0.0", port: int = 5005):
+        self.host = host
+        self.port = port
+        self._sock: Optional[socket.socket] = None
+ 
+    def open(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind((self.host, self.port))
+ 
+    def close(self):
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+ 
     def parse_packet(self, data: bytes) -> AudioPacket:
-        """Parse one UDP datagram into an AudioPacket."""
-
+    # 2-byte sequence number header — confirm exact format with Alex
+        if len(data) < 2:
+            raise ValueError(f"Datagram too short ({len(data)} bytes)")
+        (sequence,) = struct.unpack_from(">H", data, 0)
+        return AudioPacket(
+            sequence=sequence,
+            first_sample_index=0,  # populate once ESP32 header is finalized
+            timestamp=0,           # populate once ESP32 header is finalized
+            payload=data[2:],
+        )
+ 
     def receive_packet(self) -> AudioPacket:
-        """Receive and parse one UDP packet."""
+        data, _ = self._sock.recvfrom(4096)
+        return self.parse_packet(data)
 
 
 class JitterBuffer:
