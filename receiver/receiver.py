@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 from typing import Optional
+import socket
+import struct
+
 import sounddevice as sd
+
 
 @dataclass
 class AudioPacket:
@@ -8,8 +12,6 @@ class AudioPacket:
     One parsed UDP audio packet.
     """
     sequence: int
-    first_sample_index: int
-    timestamp: int
     payload: bytes
 
 
@@ -18,22 +20,71 @@ class PlcFrame:
     """
     One playback-ready frame.
     """
+    sequence: int
     payload: bytes
     synthetic: bool
-    first_sample_index: int
-    timestamp: int
+
+
+@dataclass
+class StreamMetrics:
+    packets_received: int = 0
+    packets_lost: int = 0
+    loss_rate: float = 0.0
+
+
+class MetricsCollector:
+    def __init__(self):
+        self._received = 0
+        self._lost = 0
+
+    def on_real_packet_played(self) -> None:
+        self._received += 1
+
+    def on_packet_missing(self) -> None:
+        self._lost += 1
+
+    def snapshot(self) -> StreamMetrics:
+        total = self._received + self._lost
+        return StreamMetrics(
+            packets_received=self._received,
+            packets_lost=self._lost,
+            loss_rate=self._lost / total if total > 0 else 0.0,
+        )
 
 
 class UdpReceiver:
-    """
-    Receives UDP datagrams and parses them into AudioPacket objects.
-    """
+    def __init__(self, host: str = "0.0.0.0", port: int = 5005):
+        self.host = host
+        self.port = port
+        self._sock: Optional[socket.socket] = None
+
+    def open(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind((self.host, self.port))
+        self._sock.setblocking(False)
+
+    def close(self):
+        if self._sock:
+            self._sock.close()
+            self._sock = None
 
     def parse_packet(self, data: bytes) -> AudioPacket:
-        """Parse one UDP datagram into an AudioPacket."""
+        if len(data) < 2:
+            raise ValueError(f"Datagram too short ({len(data)} bytes)")
+        (sequence,) = struct.unpack_from(">H", data, 0)
+        return AudioPacket(
+            sequence=sequence,
+            payload=data[2:],
+        )
 
-    def receive_packet(self) -> AudioPacket:
-        """Receive and parse one UDP packet."""
+    def receive_packet(self) -> Optional[AudioPacket]:
+        if self._sock is None:
+            raise RuntimeError("Socket is not open. Call open() first.")
+        try:
+            data, _ = self._sock.recvfrom(4096)
+        except BlockingIOError:
+            return None
+        return self.parse_packet(data)
 
 
 class JitterBuffer:
@@ -43,7 +94,7 @@ class JitterBuffer:
 
     def __init__(self):
         self.packets: dict[int, AudioPacket] = {}
-        self.expected_index: int = 0
+        self.expected_sequence: Optional[int] = None
 
     def push(self, packet: AudioPacket) -> None:
         """Store packet by stream position."""
@@ -63,7 +114,7 @@ class PacketLossConcealer:
     def update(self, packet: AudioPacket) -> None:
         """Remember the last good real packet."""
 
-    def generate(self, missing_index: int, timestamp: Optional[int] = None) -> PlcFrame:
+    def generate(self, missing_sequence: int) -> PlcFrame:
         """Generate a synthetic replacement frame."""
 
 
@@ -82,10 +133,12 @@ class PlaybackEngine:
         receiver: UdpReceiver,
         jitter_buffer: JitterBuffer,
         plc: PacketLossConcealer,
+        metrics: MetricsCollector,
     ):
         self.receiver = receiver
         self.jitter_buffer = jitter_buffer
         self.plc = plc
+        self.metrics = metrics
 
     def write_audio(self, frame: bytes) -> None:
         """Send PCM bytes to the audio device."""
@@ -115,10 +168,17 @@ class PlaybackEngine:
         if packet is not None:
             # use real packet
             self.plc.update(packet)
+            self.metrics.on_real_packet_played()
             frame = packet.payload
         else:
             # use PLC if missing
-            plc_frame = self.plc.generate(missing_index=0)
+            missing_sequence = (
+                self.jitter_buffer.expected_sequence
+                if self.jitter_buffer.expected_sequence is not None
+                else 0
+            )
+            plc_frame = self.plc.generate(missing_sequence=missing_sequence)
+            self.metrics.on_packet_missing()
             frame = plc_frame.payload
 
         # write final audio frame
@@ -128,25 +188,31 @@ class PlaybackEngine:
         """
         Main playback loop.
         """
+        self.receiver.open()
+        try:
+            with sd.RawOutputStream(
+                samplerate=48000,
+                channels=1,
+                dtype="int16",
+            ) as stream:
+                self._stream = stream
 
-        with sd.RawOutputStream(
-            samplerate=48000,
-            channels=1,
-            dtype="int16",
-        ) as stream:
-            self._stream = stream
+                while True:
+                    self.step()
+        finally:
+            self.receiver.close()
 
-            while True:
-                self.step()
 
 def main() -> None:
     receiver = UdpReceiver()
     jitter_buffer = JitterBuffer()
     plc = PacketLossConcealer()
+    metrics = MetricsCollector()
     engine = PlaybackEngine(
         receiver=receiver,
         jitter_buffer=jitter_buffer,
         plc=plc,
+        metrics=metrics,
     )
     engine.run()
 
