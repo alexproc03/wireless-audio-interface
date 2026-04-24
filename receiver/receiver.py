@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
-
+import sounddevice as sd
 
 @dataclass
 class AudioPacket:
@@ -89,6 +89,7 @@ class PlaybackEngine:
 
     def write_audio(self, frame: bytes) -> None:
         """Send PCM bytes to the audio device."""
+        self._stream.write(frame)
 
     def step(self) -> None:
         """
@@ -101,8 +102,54 @@ class PlaybackEngine:
             - use PLC if missing
             - write final audio frame
         """
+        # receive zero or more packets
+        while True:
+            packet = self.receiver.receive_packet()
+            if packet is None:
+                break
+            self.jitter_buffer.push(packet)
+
+        # get next packet for playback
+        packet = self.jitter_buffer.pop()
+
+        if packet is not None:
+            # use real packet
+            self.plc.update(packet)
+            frame = packet.payload
+        else:
+            # use PLC if missing
+            plc_frame = self.plc.generate(missing_index=0)
+            frame = plc_frame.payload
+
+        # write final audio frame
+        self.write_audio(frame)
 
     def run(self) -> None:
         """
         Main playback loop.
         """
+
+        with sd.RawOutputStream(
+            samplerate=48000,
+            channels=1,
+            dtype="int16",
+        ) as stream:
+            self._stream = stream
+
+            while True:
+                self.step()
+
+def main() -> None:
+    receiver = UdpReceiver()
+    jitter_buffer = JitterBuffer()
+    plc = PacketLossConcealer()
+    engine = PlaybackEngine(
+        receiver=receiver,
+        jitter_buffer=jitter_buffer,
+        plc=plc,
+    )
+    engine.run()
+
+
+if __name__ == "__main__":
+    main()
