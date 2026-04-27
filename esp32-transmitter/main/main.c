@@ -8,16 +8,25 @@
 
 #include "es8388.h"
 #include "i2c_handles.h"
+#include "audio.h"
+#include "udp_tx.h"
+
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_err.h"
+#include <string.h>
                             // M5 BUS PIN
 #define SDA_PIN         9   // 17idf.
 #define SCL_PIN         10   // 18
                         
 #define I2S_LRCK_PIN    7   // 21
-#define I2S_SCLK_PIN    5   // 22
-#define I2S_MCLK_PIN    4   // 24
-#define I2S_DIN_PIN     24  // 26
+#define I2S_SCLK_PIN    6   // 22
+#define I2S_MCLK_PIN    1   // 24
+#define I2S_DIN_PIN     0  // 26
 
-#define I2S_SAMPLE_RATE 44100
+#define I2S_SAMPLE_RATE 48000
 #define I2C_SCL_SPEED   100000
 
 #define ES8388_ADDR     0x10
@@ -27,8 +36,6 @@ i2c_master_bus_handle_t bus_handle;
 i2c_master_dev_handle_t es8388_handle;
 i2c_master_dev_handle_t stm32_handle;
 i2s_chan_handle_t rx_handle;
-
-static uint8_t buffer[2048];
 
 void i2c_init(void) {
     // Master
@@ -91,6 +98,34 @@ void i2s_init(void) {
     i2s_channel_enable(rx_handle);
 }
 
+void wifi_init_softap(void)
+{
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .ssid = "guitar_tx",
+            .ssid_len = strlen("guitar_tx"),
+            .channel = 1,
+            .password = "12345678",
+            .max_connection = 1,
+            .authmode = WIFI_AUTH_WPA2_PSK
+        }
+    };
+
+    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    esp_wifi_start();
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_NONE);
@@ -104,20 +139,10 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(500));
     es8388_init();
 
-    // Stream
-    size_t bytes_read;
-    static int16_t mono_buf[1024];
+    wifi_init_softap();
 
-    while (1) {
-        if (i2s_channel_read(rx_handle, buffer, sizeof(buffer),
-                            &bytes_read, portMAX_DELAY) == ESP_OK) {
-            int16_t *samples = (int16_t *)buffer;
-            int n = bytes_read / 2;
-            int mono_n = 0;
-            for (int i = 1; i < n; i += 2) {
-                mono_buf[mono_n++] = samples[i];
-            }
-            uart_write_bytes(UART_NUM_0, (char *)mono_buf, mono_n * 2);
-        }
-    }
+    // Create audio buffer and RTOS tasks
+    RingbufHandle_t audio_rb = xRingbufferCreate(16384, RINGBUF_TYPE_NOSPLIT);
+    ESP_ERROR_CHECK(audio_start(audio_rb));
+    ESP_ERROR_CHECK(udp_tx_start(audio_rb, "192.168.4.2", 3333));
 }

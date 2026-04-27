@@ -6,6 +6,9 @@ import struct
 import sounddevice as sd
 
 
+FRAME_PAYLOAD_BYTES = 1024
+
+
 @dataclass
 class AudioPacket:
     """
@@ -13,16 +16,6 @@ class AudioPacket:
     """
     sequence: int
     payload: bytes
-
-
-@dataclass
-class PlcFrame:
-    """
-    One playback-ready frame.
-    """
-    sequence: int
-    payload: bytes
-    synthetic: bool
 
 
 @dataclass
@@ -53,7 +46,7 @@ class MetricsCollector:
 
 
 class UdpReceiver:
-    def __init__(self, host: str = "0.0.0.0", port: int = 5005):
+    def __init__(self, host: str = "0.0.0.0", port: int = 3333):
         self.host = host
         self.port = port
         self._sock: Optional[socket.socket] = None
@@ -69,12 +62,12 @@ class UdpReceiver:
             self._sock = None
 
     def parse_packet(self, data: bytes) -> AudioPacket:
-        if len(data) < 2:
+        if len(data) < 4:
             raise ValueError(f"Datagram too short ({len(data)} bytes)")
-        (sequence,) = struct.unpack_from(">H", data, 0)
+        (sequence,) = struct.unpack_from(">I", data, 0)
         return AudioPacket(
             sequence=sequence,
-            payload=data[2:],
+            payload=data[4:],
         )
 
     def receive_packet(self) -> Optional[AudioPacket]:
@@ -91,31 +84,42 @@ class JitterBuffer:
     """
     Stores packets and releases them in stream order.
     """
+    DEPTH = 4  # packets to buffer before playback starts
+    SEQ_MOD = 2**32
+    SEQ_HALF_RANGE = 2**31
 
     def __init__(self):
         self.packets: dict[int, AudioPacket] = {}
         self.expected_sequence: Optional[int] = None
+        self._ready = False
 
     def push(self, packet: AudioPacket) -> None:
         """Store packet by stream position."""
+        # Lazy init — locks onto whatever sequence the ESP32 starts at
+        if self.expected_sequence is None:
+            self.expected_sequence = packet.sequence
+
+        # Discard packets that have already passed their slot
+        # delta > half-range means packet is behind expected in sequence space
+        delta = (packet.sequence - self.expected_sequence) % self.SEQ_MOD
+        if delta > self.SEQ_HALF_RANGE:
+            return
+
+        self.packets[packet.sequence] = packet
+
+        # Gate playback until DEPTH packets are buffered
+        if not self._ready and len(self.packets) >= self.DEPTH:
+            self._ready = True
 
     def pop(self) -> Optional[AudioPacket]:
         """Return the next packet in order, or None if unavailable."""
+        # Hold during priming — silence fills in the meantime
+        if self.expected_sequence is None or not self._ready:
+            return None
 
-
-class PacketLossConcealer:
-    """
-    Generates substitute audio when a packet is missing.
-    """
-
-    def __init__(self):
-        self.last_good_packet: Optional[AudioPacket] = None
-
-    def update(self, packet: AudioPacket) -> None:
-        """Remember the last good real packet."""
-
-    def generate(self, missing_sequence: int) -> PlcFrame:
-        """Generate a synthetic replacement frame."""
+        packet = self.packets.pop(self.expected_sequence, None)
+        self.expected_sequence = (self.expected_sequence + 1) % self.SEQ_MOD
+        return packet
 
 
 class PlaybackEngine:
@@ -125,20 +129,19 @@ class PlaybackEngine:
     Owns:
         - UDP receiver
         - jitter buffer
-        - packet loss concealer
     """
+    METRICS_INTERVAL = 100  # print metrics every N steps
 
     def __init__(
         self,
         receiver: UdpReceiver,
         jitter_buffer: JitterBuffer,
-        plc: PacketLossConcealer,
         metrics: MetricsCollector,
     ):
         self.receiver = receiver
         self.jitter_buffer = jitter_buffer
-        self.plc = plc
         self.metrics = metrics
+        self._step_count = 0
 
     def write_audio(self, frame: bytes) -> None:
         """Send PCM bytes to the audio device."""
@@ -152,37 +155,36 @@ class PlaybackEngine:
             - receive zero or more packets
             - push them into the jitter buffer
             - get next packet for playback
-            - use PLC if missing
+            - use silence if missing
             - write final audio frame
         """
-        # receive zero or more packets
+        # Drain all available packets into jitter buffer
         while True:
             packet = self.receiver.receive_packet()
             if packet is None:
                 break
             self.jitter_buffer.push(packet)
 
-        # get next packet for playback
+        # Get next in-order packet
         packet = self.jitter_buffer.pop()
 
         if packet is not None:
-            # use real packet
-            self.plc.update(packet)
             self.metrics.on_real_packet_played()
             frame = packet.payload
         else:
-            # use PLC if missing
-            missing_sequence = (
-                self.jitter_buffer.expected_sequence
-                if self.jitter_buffer.expected_sequence is not None
-                else 0
-            )
-            plc_frame = self.plc.generate(missing_sequence=missing_sequence)
             self.metrics.on_packet_missing()
-            frame = plc_frame.payload
+            frame = b"\x00" * FRAME_PAYLOAD_BYTES
 
-        # write final audio frame
         self.write_audio(frame)
+
+        # Print metrics snapshot periodically
+        self._step_count += 1
+        if self._step_count % self.METRICS_INTERVAL == 0:
+            m = self.metrics.snapshot()
+            print(
+                f"[metrics] recv={m.packets_received} lost={m.packets_lost} "
+                f"loss={m.loss_rate:.1%}"
+            )
 
     def run(self) -> None:
         """
@@ -206,12 +208,10 @@ class PlaybackEngine:
 def main() -> None:
     receiver = UdpReceiver()
     jitter_buffer = JitterBuffer()
-    plc = PacketLossConcealer()
     metrics = MetricsCollector()
     engine = PlaybackEngine(
         receiver=receiver,
         jitter_buffer=jitter_buffer,
-        plc=plc,
         metrics=metrics,
     )
     engine.run()
