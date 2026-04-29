@@ -22,7 +22,7 @@ esp_err_t es8388_init(void) {
     res |= es8388_write_reg(0x03, 0x00);  // ADC power up all
     res |= es8388_write_reg(0x0A, 0x00);  // LIN1/RIN1
     res |= es8388_write_reg(0x0B, 0x00);  // Stereo
-    res |= es8388_write_reg(0x09, 0x00);  // PGA +24dB
+    res |= es8388_write_reg(0x09, 0x88);  // PGA +24dB
     res |= es8388_write_reg(0x0C, 0x2C);  // I2S 16-bit, ADCLRP=1
     res |= es8388_write_reg(0x0D, 0x02);  // MCLK/256
     res |= es8388_write_reg(0x0F, 0x28);  // ADC soft ramp

@@ -71,6 +71,8 @@ void i2c_init(void) {
 void i2s_init(void) {
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 2;
+    chan_cfg.dma_frame_num = 64;
     i2s_new_channel(&chan_cfg, NULL, &rx_handle);
 
     i2s_std_config_t std_cfg = {
@@ -100,30 +102,30 @@ void i2s_init(void) {
 
 void wifi_init_softap(void)
 {
-    nvs_flash_init();
-    esp_netif_init();
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 
     wifi_config_t ap_config = {
         .ap = {
             .ssid = "guitar_tx",
             .ssid_len = strlen("guitar_tx"),
-            .channel = 1,
+            .channel = 36,
             .password = "12345678",
             .max_connection = 1,
-            .authmode = WIFI_AUTH_WPA2_PSK
+            .authmode = WIFI_AUTH_WPA2_PSK,
         }
     };
 
-    esp_wifi_set_config(WIFI_IF_AP, &ap_config);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
 }
 
 void app_main(void)

@@ -10,14 +10,14 @@
 
 extern i2s_chan_handle_t rx_handle;
 
-static uint8_t buffer[2048];
+static uint8_t buffer[256];
 
 static void audio_task(void *arg)
 {
     RingbufHandle_t rb = (RingbufHandle_t)arg;
 
     size_t bytes_read;
-    static int16_t mono_buf[1024];
+    static int16_t mono_buf[64];
     static uint8_t packet_buf[4 + sizeof(mono_buf)];
     static uint32_t sequence = 0;
 

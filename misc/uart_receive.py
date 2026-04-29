@@ -1,9 +1,9 @@
 import serial, struct, time, wave
 
 # Script to record audio when over serial
-PORT = "COM7"
+PORT = "COM6"
 BAUD = 2_000_000
-SAMPLE_RATE = 44100
+SAMPLE_RATE = 48000
 WAV_FILE = "capture.wav"
 
 ser = serial.Serial(PORT, BAUD, timeout=1)

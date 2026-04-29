@@ -1,12 +1,19 @@
 from dataclasses import dataclass
 from typing import Optional
+from collections import deque
 import socket
 import struct
+import threading
+import time
 
 import sounddevice as sd
+import numpy as np
 
-
-FRAME_PAYLOAD_BYTES = 1024
+FRAME_PAYLOAD_BYTES = 128
+QUEUE_MAX_FRAMES = 24
+QUEUE_TARGET_FRAMES = 7
+QUEUE_TRIM_TOLERANCE = 3
+GAIN = 2
 
 
 @dataclass
@@ -23,26 +30,44 @@ class StreamMetrics:
     packets_received: int = 0
     packets_lost: int = 0
     loss_rate: float = 0.0
+    frames_dropped: int = 0
+    frames_silence: int = 0
 
 
 class MetricsCollector:
     def __init__(self):
         self._received = 0
         self._lost = 0
+        self._frames_dropped = 0
+        self._frames_silence = 0
+        self._lock = threading.Lock()
 
     def on_real_packet_played(self) -> None:
-        self._received += 1
+        with self._lock:
+            self._received += 1
 
-    def on_packet_missing(self) -> None:
-        self._lost += 1
+    def on_packet_missing(self, count: int = 1) -> None:
+        with self._lock:
+            self._lost += count
+
+    def on_frame_dropped(self) -> None:
+        with self._lock:
+            self._frames_dropped += 1
+
+    def on_silence_played(self) -> None:
+        with self._lock:
+            self._frames_silence += 1
 
     def snapshot(self) -> StreamMetrics:
-        total = self._received + self._lost
-        return StreamMetrics(
-            packets_received=self._received,
-            packets_lost=self._lost,
-            loss_rate=self._lost / total if total > 0 else 0.0,
-        )
+        with self._lock:
+            total = self._received + self._lost
+            return StreamMetrics(
+                packets_received=self._received,
+                packets_lost=self._lost,
+                loss_rate=self._lost / total if total > 0 else 0.0,
+                frames_dropped=self._frames_dropped,
+                frames_silence=self._frames_silence,
+            )
 
 
 class UdpReceiver:
@@ -54,7 +79,7 @@ class UdpReceiver:
     def open(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind((self.host, self.port))
-        self._sock.setblocking(False)
+        self._sock.settimeout(0.05)
 
     def close(self):
         if self._sock:
@@ -75,51 +100,67 @@ class UdpReceiver:
             raise RuntimeError("Socket is not open. Call open() first.")
         try:
             data, _ = self._sock.recvfrom(4096)
-        except BlockingIOError:
+        except socket.timeout:
             return None
         return self.parse_packet(data)
 
 
-class JitterBuffer:
+class FrameQueue:
     """
-    Stores packets and releases them in stream order.
+    Jitter buffer with a single target depth.
+
+    - On push: drops oldest frames if depth has been persistently above target.
+    - On pop: returns None until depth reaches target (re-prime), so startup
+      and post-underrun recovery use the same code path.
     """
-    DEPTH = 4  # packets to buffer before playback starts
-    SEQ_MOD = 2**32
-    SEQ_HALF_RANGE = 2**31
 
-    def __init__(self):
-        self.packets: dict[int, AudioPacket] = {}
-        self.expected_sequence: Optional[int] = None
-        self._ready = False
+    def __init__(
+        self,
+        max_frames: int,
+        target_frames: int,
+        trim_tolerance: int,
+        metrics: MetricsCollector,
+    ):
+        self._frames = deque()
+        self._max_frames = max_frames
+        self._target_frames = target_frames
+        self._trim_threshold = target_frames + trim_tolerance
+        self._lock = threading.Lock()
+        self._metrics = metrics
+        self._primed = False
 
-    def push(self, packet: AudioPacket) -> None:
-        """Store packet by stream position."""
-        # Lazy init — locks onto whatever sequence the ESP32 starts at
-        if self.expected_sequence is None:
-            self.expected_sequence = packet.sequence
-
-        # Discard packets that have already passed their slot
-        # delta > half-range means packet is behind expected in sequence space
-        delta = (packet.sequence - self.expected_sequence) % self.SEQ_MOD
-        if delta > self.SEQ_HALF_RANGE:
+    def push(self, frame: bytes) -> None:
+        if len(frame) != FRAME_PAYLOAD_BYTES:
             return
 
-        self.packets[packet.sequence] = packet
+        with self._lock:
+            while len(self._frames) >= self._max_frames:
+                self._frames.popleft()
+                self._metrics.on_frame_dropped()
 
-        # Gate playback until DEPTH packets are buffered
-        if not self._ready and len(self.packets) >= self.DEPTH:
-            self._ready = True
+            # Drift correction: only trim when depth has clearly exceeded target.
+            # Tolerates normal bursts up to (target + tolerance) without dropping.
+            if len(self._frames) >= self._trim_threshold:
+                self._frames.popleft()
+                self._metrics.on_frame_dropped()
 
-    def pop(self) -> Optional[AudioPacket]:
-        """Return the next packet in order, or None if unavailable."""
-        # Hold during priming — silence fills in the meantime
-        if self.expected_sequence is None or not self._ready:
-            return None
+            self._frames.append(frame)
 
-        packet = self.packets.pop(self.expected_sequence, None)
-        self.expected_sequence = (self.expected_sequence + 1) % self.SEQ_MOD
-        return packet
+    def pop(self) -> Optional[bytes]:
+        with self._lock:
+            if not self._primed:
+                if len(self._frames) >= self._target_frames:
+                    self._primed = True
+                else:
+                    return None
+            if not self._frames:
+                self._primed = False
+                return None
+            return self._frames.popleft()
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._frames)
 
 
 class PlaybackEngine:
@@ -128,90 +169,115 @@ class PlaybackEngine:
 
     Owns:
         - UDP receiver
-        - jitter buffer
+        - bounded frame queue
     """
-    METRICS_INTERVAL = 100  # print metrics every N steps
+    METRICS_INTERVAL_SEC = 1.0
 
     def __init__(
         self,
         receiver: UdpReceiver,
-        jitter_buffer: JitterBuffer,
+        frame_queue: FrameQueue,
         metrics: MetricsCollector,
     ):
         self.receiver = receiver
-        self.jitter_buffer = jitter_buffer
+        self.frame_queue = frame_queue
         self.metrics = metrics
-        self._step_count = 0
 
-    def write_audio(self, frame: bytes) -> None:
-        """Send PCM bytes to the audio device."""
-        self._stream.write(frame)
+        self._running = False
+        self._rx_thread: Optional[threading.Thread] = None
+        self._last_sequence: Optional[int] = None
+        self._last_metrics_time = 0.0
+        self._silence_frame = b"\x00" * FRAME_PAYLOAD_BYTES
 
-    def step(self) -> None:
-        """
-        Run one pipeline step.
-
-        Typical behavior:
-            - receive zero or more packets
-            - push them into the jitter buffer
-            - get next packet for playback
-            - use silence if missing
-            - write final audio frame
-        """
-        # Drain all available packets into jitter buffer
-        while True:
+    def _rx_loop(self) -> None:
+        while self._running:
             packet = self.receiver.receive_packet()
             if packet is None:
-                break
-            self.jitter_buffer.push(packet)
+                continue
 
-        # Get next in-order packet
-        packet = self.jitter_buffer.pop()
+            if self._last_sequence is not None:
+                delta = (packet.sequence - self._last_sequence) & 0xFFFFFFFF
+                if delta > 1:
+                    self.metrics.on_packet_missing(delta - 1)
 
-        if packet is not None:
-            self.metrics.on_real_packet_played()
-            frame = packet.payload
+            self._last_sequence = packet.sequence
+            self.frame_queue.push(packet.payload)
+
+    def _audio_callback(self, outdata, frames, time_info, status) -> None:
+        if status:
+            print(status)
+
+        if frames * 2 != FRAME_PAYLOAD_BYTES:
+            outdata[:] = self._silence_frame
+            self.metrics.on_silence_played()
+            return
+
+        frame = self.frame_queue.pop()
+        if frame is None:
+            outdata[:] = self._silence_frame
+            self.metrics.on_silence_played()
         else:
-            self.metrics.on_packet_missing()
-            frame = b"\x00" * FRAME_PAYLOAD_BYTES
+            samples = np.frombuffer(frame, dtype=np.int16).astype(np.int32)
+            samples = np.clip(samples * GAIN, -32768, 32767).astype(np.int16)
+            boosted = samples.tobytes()
 
-        self.write_audio(frame)
-
-        # Print metrics snapshot periodically
-        self._step_count += 1
-        if self._step_count % self.METRICS_INTERVAL == 0:
-            m = self.metrics.snapshot()
-            print(
-                f"[metrics] recv={m.packets_received} lost={m.packets_lost} "
-                f"loss={m.loss_rate:.1%}"
-            )
+            outdata[:] = boosted
+            self.metrics.on_real_packet_played()
 
     def run(self) -> None:
         """
         Main playback loop.
         """
         self.receiver.open()
+        self._running = True
+        self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self._rx_thread.start()
+
         try:
             with sd.RawOutputStream(
                 samplerate=48000,
                 channels=1,
                 dtype="int16",
+                blocksize=64,
+                device=8,
+                latency="low",
+                callback=self._audio_callback,
             ) as stream:
-                self._stream = stream
+                print("stream latency:", stream.latency)
 
+                self._last_metrics_time = time.time()
                 while True:
-                    self.step()
+                    now = time.time()
+                    if now - self._last_metrics_time >= self.METRICS_INTERVAL_SEC:
+                        m = self.metrics.snapshot()
+                        print(
+                            f"[metrics] recv={m.packets_received} "
+                            f"lost={m.packets_lost} "
+                            f"loss={m.loss_rate:.1%} "
+                            f"dropped={m.frames_dropped} "
+                            f"silence={m.frames_silence} "
+                            f"queue={self.frame_queue.size()}"
+                        )
+                        self._last_metrics_time = now
+                    time.sleep(0.05)
+
         finally:
+            self._running = False
             self.receiver.close()
 
 
 def main() -> None:
     receiver = UdpReceiver()
-    jitter_buffer = JitterBuffer()
     metrics = MetricsCollector()
+    frame_queue = FrameQueue(
+        max_frames=QUEUE_MAX_FRAMES,
+        target_frames=QUEUE_TARGET_FRAMES,
+        trim_tolerance=QUEUE_TRIM_TOLERANCE,
+        metrics=metrics,
+    )
     engine = PlaybackEngine(
         receiver=receiver,
-        jitter_buffer=jitter_buffer,
+        frame_queue=frame_queue,
         metrics=metrics,
     )
     engine.run()
